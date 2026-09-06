@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Iterator
 import click
 from click.core import ParameterSource
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__
@@ -765,6 +766,36 @@ def topics(keyword: str, as_json: bool):
 
     except Exception as e:
         console.print(f"[red]❌ Failed to search topics: {e}[/red]")
+        sys.exit(1)
+
+
+# ===== AI Chat (点点) =====
+
+@cli.command()
+@click.argument("question")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
+def ai(question: str, as_json: bool):
+    """Ask 点点 (Xiaohongshu AI assistant) a QUESTION."""
+    try:
+        with _get_client() as client:
+            result = client.ai_chat(question)
+
+            if as_json:
+                click.echo(json.dumps(result, indent=2, ensure_ascii=False))
+                return
+
+            answer = (result or {}).get("answer", "")
+            if not answer:
+                console.print("[yellow]Empty answer from 点点.[/yellow]")
+                return
+
+            console.print(f"[bold cyan]Q:[/bold cyan] {question}")
+            console.print()
+            console.print(f"[bold green]点点:[/bold green]")
+            console.print(Panel(answer, border_style="green"))
+
+    except Exception as e:
+        console.print(f"[red]❌ Failed to chat with 点点: {e}[/red]")
         sys.exit(1)
 
 

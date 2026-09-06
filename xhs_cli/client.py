@@ -591,6 +591,124 @@ class XhsClient:
                     return result[key]
         return []
 
+    # ===== AI Chat (点点) =====
+
+    def ai_chat(self, question: str, timeout: float = 90.0) -> dict:
+        """Ask 点点 (Xiaohongshu AI assistant) a question via the ai_chat page.
+
+        Real-clicks the visible input box, types via insert_text (which fires
+        proper input events that Vue picks up), clicks send, then polls the
+        chat container until the streamed answer stabilizes.
+
+        Returns {"answer": cleaned text, "raw": full chat-container text}.
+        """
+        self._goto(
+            "https://www.xiaohongshu.com/ai_chat",
+            timeout=30000,
+            wait_min=2.0,
+            wait_max=3.5,
+            context="loading ai_chat page",
+        )
+
+        # The welcome page stacks duplicate textareas at identical positions;
+        # only real pointer events + insert_text reliably drive its Vue state.
+        target = None
+        deadline = time.time() + 10.0
+        while time.time() < deadline and target is None:
+            rects = self._page.evaluate(
+                """() => {
+                    return [...document.querySelectorAll('textarea[name="aiSearchTextarea"]')]
+                        .map(t => {
+                            const r = t.getBoundingClientRect();
+                            return {x: r.x, y: r.y, w: r.width, h: r.height};
+                        })
+                        .filter(r => r.h > 0 && r.w > 0);
+                }"""
+            )
+            target = max(rects, key=lambda r: r["w"]) if rects else None
+            if target is None:
+                time.sleep(0.5)
+        if target is None:
+            raise DataFetchError("ai_chat input box not found")
+
+        self._page.mouse.click(target["x"] + target["w"] / 2, target["y"] + target["h"] / 2)
+        self._human_wait(0.3, 0.6)
+        self._page.keyboard.insert_text(question)
+        self._human_wait(0.5, 1.0)
+
+        has_value = self._page.evaluate(
+            """() => [...document.querySelectorAll('textarea[name="aiSearchTextarea"]')]
+                .some(t => !!t.value)"""
+        )
+        if not has_value:
+            raise DataFetchError("ai_chat input did not accept text")
+
+        # Locate the send button relative to the textarea that holds the text.
+        btn = self._page.evaluate(
+            """() => {
+                const ta = [...document.querySelectorAll('textarea[name="aiSearchTextarea"]')]
+                    .find(t => t.value);
+                if (!ta) return null;
+                const root = ta.closest('.textarea-container') || ta.closest('[class*="wendian-wrapper"]');
+                if (!root) return null;
+                const b = root.querySelector('.bottom-box-right-submit-button');
+                if (!b) return null;
+                const r = b.getBoundingClientRect();
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+            }"""
+        )
+        if not btn:
+            raise DataFetchError("ai_chat send button not found")
+        self._page.mouse.click(btn["x"], btn["y"])
+
+        # Poll until the streamed answer stops growing.
+        deadline = time.time() + timeout
+        last_len, stable_polls = -1, 0
+        raw = ""
+        while time.time() < deadline:
+            self._human_wait(1.5, 2.5)
+            snap = self._page.evaluate(
+                """() => {
+                    const c = document.querySelector('.chat-container');
+                    const len = c ? (c.innerText || '').length : -1;
+                    const streaming = [...document.querySelectorAll('svg use')]
+                        .some(u => (u.getAttribute('href') || '').includes('stop'));
+                    const text = c ? (c.innerText || '') : '';
+                    return {len, streaming, text};
+                }"""
+            )
+            raw = snap["text"]
+            if snap["len"] > 0:
+                if snap["len"] == last_len and not snap["streaming"]:
+                    stable_polls += 1
+                    if stable_polls >= 2:
+                        break
+                else:
+                    stable_polls = 0
+                last_len = snap["len"]
+        else:
+            logger.warning("ai_chat answer did not stabilize within %.0fs", timeout)
+
+        return {"answer": self._clean_ai_answer(raw, question), "raw": raw}
+
+    @staticmethod
+    def _clean_ai_answer(raw: str, question: str) -> str:
+        """Strip question echoes, meta chips and disclaimer lines from raw text."""
+        lines = (raw or "").splitlines()
+        kept = []
+        for line in lines:
+            t = line.strip()
+            if not t:
+                continue
+            if t == question.strip():
+                continue
+            if re.match(r"^ai\s*(总结|搜索)", t) or re.search(r"篇笔记", t):
+                continue
+            if t in ("新会话", "内容由AI生成，请注意核实"):
+                continue
+            kept.append(t)
+        return "\n".join(kept)
+
     # ===== Favorites =====
 
     def get_favorites(self, max_count: int = 50) -> list[dict]:
