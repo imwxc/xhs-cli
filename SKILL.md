@@ -216,6 +216,29 @@ rendered DOM when the state has been consumed by hydration. Current behavior:
 - `xsec_token` values are single-use-ish and expire; re-run `xhs search` to
   refresh them if `read` starts failing.
 
+### When Xiaohongshu updates its frontend again (expected)
+
+This **will happen again** — it broke extraction once in September 2026 and
+the fix above is a fallback layer, not a permanent guarantee. Recognize and
+repair it as follows:
+
+- **Symptom**: `search.feeds not ready`, `note.noteDetailMap not ready`,
+  `note detail DOM not ready`, or "Failed to extract" errors **with a valid
+  login** (i.e. the feed/explore pages render fine in a real browser). If the
+  page instead shows a login wall, it is an expired session — re-login first
+  and only then suspect a frontend change.
+- **Diagnose**: open the failing page in a browser and inspect the rendered
+  DOM. Check whether the old anchors still exist (`section.note-item`,
+  `#detail-title`, `#detail-desc`, `.comment-item`, `.textarea` on ai_chat)
+  and whether card hrefs still carry `xsec_token`. Also dump
+  `Object.keys(window)` — if `__INITIAL_STATE__` has come back, prefer it.
+- **Fix**: update the selector strings inside the fallback JS blocks in
+  `xhs_cli/client.py` (`search_notes`, `_extract_note_detail_dom`,
+  `_extract_comments_dom`, `ai_chat`) — they are plain CSS selectors and can
+  be rewritten without touching the surrounding flow.
+- **Discipline**: keep the DOM fallbacks as the source of truth; treat any
+  return of `__INITIAL_STATE__`-only parsing as a regression.
+
 ## Environment Notes
 
 - The bundled uBlock Origin addon is **intentionally skipped**
