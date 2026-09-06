@@ -1,8 +1,8 @@
 ---
 name: xhs-cli
-description: "Headless-browser-based CLI skill for Xiaohongshu (小红书, RedNote, XHS) to search notes, read posts, browse profiles, like, favorite, comment, and publish from the terminal"
+description: "Headless-browser-based CLI skill for Xiaohongshu (小红书, RedNote, XHS) to search notes, read posts, browse profiles, like, favorite, comment, publish from the terminal, and chat with the Diandian (点点) AI assistant"
 author: jackwener
-version: "1.0.0"
+version: "1.1.0"
 tags:
   - xhs
   - xiaohongshu
@@ -10,6 +10,8 @@ tags:
   - rednote
   - social-media
   - cli
+  - mcp
+  - ai
 ---
 
 > [!NOTE]
@@ -59,6 +61,27 @@ xhs read <note_id> --comments  # Include comments
 xhs read <note_id> --xsec-token <token>  # Manual token
 xhs read <note_id> --json
 ```
+
+> [!IMPORTANT]
+> A note page returns HTTP 404 (error 300031) without a valid `xsec_token`.
+> **Always run `xhs search` first** — it caches the token for each result —
+> then `xhs read <note_id>` resolves it automatically.
+
+### AI Chat (Diandian 点点)
+
+```bash
+xhs ai "周末上海周边有什么小众一日游？"          # Ask, get the answer in a panel
+xhs ai "问题" --json                          # {"answer": cleaned, "raw": full text}
+```
+
+- Drives the web Diandian page (`xiaohongshu.com/ai_chat`) inside the same
+  headless session and captures the streamed answer.
+- One-shot per invocation (each run starts a fresh conversation); takes
+  ~15-60s depending on answer length.
+- The `answer` field is cleaned (question echo, "ai总结N篇笔记" meta chip and
+  disclaimer removed); `raw` keeps everything.
+- Like any AI summary, answers may hallucinate — for fact-checking workflows,
+  prefer `xhs search` + `xhs read` over `xhs ai`.
 
 ### User
 
@@ -161,9 +184,62 @@ xhs read <note_id> --comments --json
 - Login-required commands show clear instruction to run `xhs login`
 - `xsec_token` is auto-resolved from cache; manual `--xsec-token` available as fallback
 
+## Session Troubleshooting (important for agents)
+
+- `xhs status` only checks that a local cookie file exists — it can report
+  "Logged in" while the **server-side session has already expired**.
+- **Treat these errors as an expired session, not a bug**: `search.feeds not
+  ready after 15.0s`, `note.noteDetailMap not ready after 15.0s`, `user info
+  not ready after 10.0s`. Re-login with `xhs login --qrcode`, then retry.
+- QR login quirks:
+  - The QR code prints to stdout as terminal art and the whole flow times out
+    after **4 minutes**. When running in the background, poll the log for the
+    QR URL and render it as an image/PNG for the user to scan quickly
+    (`npx -y qrcode -o qr.png "<qr_url>"`), or paste the QR art directly.
+  - A QR code expires after ~1-2 minutes; if it expires the page shows a
+    refresh overlay — restart the login for a fresh code.
+  - If launch hangs on "Falling back to QR code login...", kill leftovers
+    first: `taskkill /f /im camoufox.exe` (Windows) and retry.
+
+## Frontend Compatibility Notes (verified 2026-09)
+
+Xiaohongshu's web frontend changes over time. The CLI extracts from
+`window.__INITIAL_STATE__` where available and falls back to parsing the
+rendered DOM when the state has been consumed by hydration. Current behavior:
+
+- **Search**: results are parsed from `section.note-item` cards when needed.
+  Each card's link carries the note id and the `xsec_token` (base64, may end
+  with `=`) required by `read`/`like`/`favorite`.
+- **Read**: note detail and comments fall back to the rendered
+  `#detail-title` / `#detail-desc` / `.comment-item` elements. The returned
+  `time`/`ipLocation` fields are best-effort in fallback mode.
+- `xsec_token` values are single-use-ish and expire; re-run `xhs search` to
+  refresh them if `read` starts failing.
+
+## Environment Notes
+
+- The bundled uBlock Origin addon is **intentionally skipped**
+  (`exclude_addons`): addons.mozilla.org is unreachable on some networks and
+  stalls every launch. Add it back by removing the `exclude_addons` argument
+  in `xhs_cli/client.py` / `xhs_cli/auth.py` if you need ad blocking.
+- Headless launches force **software rendering** (`firefox_user_prefs`) to
+  avoid `GFX1-RenderCompositorSWGL` crashes on machines with flaky GPU
+  drivers.
+- If launches still time out (`BrowserType.launch: Timeout ... exceeded`) or
+  the browser crashes on start, the local Camoufox build is likely corrupted —
+  reinstall it:
+
+  ```bash
+  taskkill /f /im camoufox.exe        # clear stuck processes (Windows)
+  python -m camoufox fetch            # re-download / re-extract
+  ```
+
 ## Safety Notes
 
 - Do not ask users to share raw cookie values in chat logs.
 - Prefer auto-extraction via `xhs login` over manual cookie input.
 - If auth fails, ask the user to re-login via `xhs login`.
+- This tool drives a real logged-in session — space out requests and keep
+  volumes low; aggressive scraping risks account-level risk control
+  (error 300011 "账号异常" / 300031 page 404).
 
