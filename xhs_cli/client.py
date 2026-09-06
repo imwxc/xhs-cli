@@ -120,10 +120,24 @@ class XhsClient:
 
     def start(self):
         """Launch camoufox and inject cookies."""
+        from camoufox.addons import DefaultAddons
         from camoufox.sync_api import Camoufox
 
         logger.info("Starting camoufox browser...")
-        self._camoufox_ctx = Camoufox(headless=True)
+        # Skip the bundled uBlock Origin download: addons.mozilla.org is
+        # unreachable on some networks and stalls every launch. Force software
+        # rendering: headless camoufox can crash mapping the framebuffer on
+        # flaky GPU drivers (GFX1-RenderCompositorSWGL).
+        self._camoufox_ctx = Camoufox(
+            headless=True,
+            exclude_addons=[DefaultAddons.UBO],
+            firefox_user_prefs={
+                "gfx.webrender.software": True,
+                "layers.acceleration.disabled": True,
+                "gfx.direct2d.disabled": True,
+                "dom.webgpu.enabled": False,
+            },
+        )
         self._browser = self._camoufox_ctx.__enter__()
         self._page = self._browser.new_page()
 
@@ -188,7 +202,7 @@ class XhsClient:
             }""",
             timeout=15.0,
             desc="search.feeds",
-            raise_on_timeout=True,
+            raise_on_timeout=False,
         )
 
         # Extract search feeds
@@ -202,6 +216,51 @@ class XhsClient:
             return unwrap(s.search.feeds, 0);
         }"""
         )
+
+        if not result or not (isinstance(result, list) and result):
+            # Newer frontend hydrates the page and clears __INITIAL_STATE__,
+            # so fall back to parsing the rendered note cards. The card hrefs
+            # carry the note id and the xsec_token needed by `read`/`like`.
+            logger.info("Falling back to DOM extraction for search results")
+            self._wait_for_data(
+                "() => document.querySelectorAll('section.note-item a[href]').length > 0",
+                timeout=15.0,
+                desc="DOM note cards",
+                raise_on_timeout=True,
+            )
+            result = self._page.evaluate(
+                """() => {
+                    const out = [];
+                    const seen = new Set();
+                    document.querySelectorAll('section.note-item').forEach(sec => {
+                        // The first <a> in a card is a hidden /explore/ link
+                        // WITHOUT the token; prefer the token-bearing one.
+                        const a = sec.querySelector('a[href*="xsec_token"]')
+                            || sec.querySelector('a[href*="/explore/"], a[href*="/search_result/"]');
+                        if (!a) return;
+                        const href = a.getAttribute('href') || '';
+                        const m = href.match(/\\/(?:explore|search_result)\\/([0-9a-f]{24})/i);
+                        if (!m || seen.has(m[1])) return;
+                        seen.add(m[1]);
+                        // Token is base64 and may end with '=' padding.
+                        const token = (href.match(/xsec_token=([A-Za-z0-9_=-]+)/) || [])[1] || '';
+                        const text = sel => {
+                            const el = sec.querySelector(sel);
+                            return el ? (el.textContent || '').trim() : '';
+                        };
+                        out.push({
+                            id: m[1],
+                            xsec_token: token,
+                            note_card: {
+                                display_title: text('.title'),
+                                user: {nickname: text('.author .name')},
+                                interact_info: {liked_count: text('.like-wrapper .count')},
+                            },
+                        });
+                    });
+                    return out;
+                }"""
+            )
 
         if not result:
             logger.warning("No search results found in __INITIAL_STATE__")
@@ -237,7 +296,7 @@ class XhsClient:
             }""",
             timeout=15.0,
             desc="note.noteDetailMap",
-            raise_on_timeout=True,
+            raise_on_timeout=False,
         )
 
         # Extract note detail
@@ -264,7 +323,66 @@ class XhsClient:
 
             time.sleep(0.5)
 
-        raise DataFetchError(f"Failed to extract note detail for {note_id}")
+        # Newer frontend hydrates the page and clears __INITIAL_STATE__, so
+        # fall back to parsing the rendered note detail DOM.
+        return self._extract_note_detail_dom(note_id)
+
+    def _extract_note_detail_dom(self, note_id: str) -> dict:
+        """Extract the rendered note detail as a state-shaped dict."""
+        self._wait_for_data(
+            "() => !!document.querySelector('#detail-title, #detail-desc, .note-content')",
+            timeout=15.0,
+            desc="note detail DOM",
+            raise_on_timeout=True,
+        )
+        note = self._page.evaluate(
+            """(noteId) => {
+                const pick = (sels) => {
+                    for (const s of sels) {
+                        const el = document.querySelector(s);
+                        if (el && (el.textContent || '').trim()) {
+                            return (el.textContent || '').trim();
+                        }
+                    }
+                    return '';
+                };
+                const count = (sels) => {
+                    for (const s of sels) {
+                        const el = document.querySelector(s);
+                        if (el) {
+                            const t = (el.textContent || '').trim();
+                            if (t) return t;
+                        }
+                    }
+                    return '0';
+                };
+                const title = pick(['#detail-title', '.note-content .title', '.title']);
+                const desc = pick(['#detail-desc', '.note-content .desc', '.desc']);
+                const author = pick(['.author-container .username', '.author .username', '.username']);
+                const dateEl = document.querySelector('.bottom-container .date, .date');
+                const dateText = dateEl ? (dateEl.textContent || '').trim() : '';
+                const m = dateText.match(/((\\d{4}-\\d{2}-\\d{2})|\\d+\\s*天前|\\d+\\s*小时前|昨天|今天)/);
+                return {
+                    note: {
+                        id: noteId,
+                        title,
+                        desc,
+                        user: {nickname: author},
+                        time: m ? m[1] : dateText,
+                        ipLocation: (dateText.match(/IP\\u5c5e\\u5730(\\S+)/) || [])[1] || '',
+                        interactInfo: {
+                            likedCount: count(['.like-wrapper .count', '.interact-container .count']),
+                            collectedCount: count(['.collect-wrapper .count']),
+                            commentCount: count(['.chat-wrapper .count']),
+                        },
+                    },
+                };
+            }""",
+            note_id,
+        )
+        if not note or not (note.get("note") or {}).get("desc"):
+            raise DataFetchError(f"Failed to extract note detail for {note_id}")
+        return note
 
     # ===== User Profile =====
 
@@ -969,7 +1087,7 @@ class XhsClient:
         }""", note_id)
 
         if not comments_data:
-            return []
+            return self._extract_comments_dom(max_comments)
         if isinstance(comments_data, dict):
             for key in ("comments", "list", "data", "items"):
                 value = comments_data.get(key)
@@ -977,10 +1095,58 @@ class XhsClient:
                     comments_data = value
                     break
         if not isinstance(comments_data, list):
-            return []
+            return self._extract_comments_dom(max_comments)
         if max_comments <= 0:
             return comments_data
         return comments_data[:max_comments]
+
+    def _extract_comments_dom(self, max_comments: int = 50) -> list[dict]:
+        """Extract rendered comments as state-shaped dicts.
+
+        Scrolling: comments load lazily, so nudge the comments panel a few
+        times before giving up.
+        """
+        import random
+
+        for _ in range(3):
+            n = self._page.evaluate(
+                "() => document.querySelectorAll('.comment-item').length"
+            )
+            if n >= max_comments:
+                break
+            self._page.evaluate(
+                """() => {
+                    const list = document.querySelector('.comments-list, .comments-container');
+                    if (list) list.scrollTop = list.scrollHeight;
+                    window.scrollTo(0, document.body.scrollHeight);
+                }"""
+            )
+            time.sleep(random.uniform(1.0, 2.0))
+
+        comments = self._page.evaluate(
+            """(maxN) => {
+                const out = [];
+                document.querySelectorAll('.comment-item').forEach(c => {
+                    if (out.length >= maxN) return;
+                    const name = c.querySelector('.author .name');
+                    const content = c.querySelector('.content .note-text, .content');
+                    const date = c.querySelector('.content .date, .date, .info .date');
+                    const like = c.querySelector('.like-wrapper .count');
+                    const info = date ? (date.textContent || '').trim() : '';
+                    const m = info.match(/((\\d{4}-\\d{2}-\\d{2})|\\d+\\s*天前|\\d+\\s*小时前|昨天|今天)/);
+                    out.push({
+                        userInfo: {nickname: name ? (name.textContent || '').trim() : ''},
+                        content: content ? (content.textContent || '').trim() : '',
+                        time: m ? m[1] : info,
+                        ip_location: (info.match(/IP\\u5c5e\\u5730(\\S+)/) || [])[1] || '',
+                        likeCount: like ? (like.textContent || '').trim() : '',
+                    });
+                });
+                return out;
+            }""",
+            max_comments,
+        )
+        return [c for c in comments if c.get("content")]
 
     # ===== Like / Unlike =====
 
